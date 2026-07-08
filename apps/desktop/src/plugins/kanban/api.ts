@@ -11,7 +11,7 @@
 
 import { atom, host, type PluginRestOptions } from '@hermes/plugin-sdk'
 
-import type { KanbanBoard, KanbanTaskDetail } from './types'
+import type { KanbanBoard, KanbanTask, KanbanTaskDetail } from './types'
 
 type Rest = <T>(path: string, opts?: PluginRestOptions) => Promise<T>
 
@@ -33,6 +33,9 @@ export const fetchTask = (id: string) => call<KanbanTaskDetail>(`/tasks/${id}`)
 
 export const patchTask = (id: string, patch: Record<string, unknown>) =>
   call(`/tasks/${id}`, { method: 'PATCH', body: patch })
+
+export const createTask = (body: Record<string, unknown>) =>
+  call<{ task: KanbanTask | null }>('/tasks', { method: 'POST', body })
 
 export async function refreshBoard(): Promise<void> {
   try {

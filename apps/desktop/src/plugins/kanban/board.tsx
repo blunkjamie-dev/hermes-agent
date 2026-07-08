@@ -13,17 +13,20 @@ import {
   Codicon,
   Dialog,
   DialogContent,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
   EmptyState,
   ErrorState,
   GlyphSpinner,
+  Input,
   ScrollArea,
+  Textarea,
   useValue
 } from '@hermes/plugin-sdk'
 import { useEffect, useState } from 'react'
 
-import { $board, $boardError, fetchTask, patchTask, refreshBoard } from './api'
+import { $board, $boardError, createTask, fetchTask, patchTask, refreshBoard } from './api'
 import { columnMeta, type KanbanBoard, type KanbanTask, type KanbanTaskDetail } from './types'
 
 // Optimistically relocate a card so the drop lands instantly; the follow-up
@@ -117,12 +120,14 @@ function Card({ onOpen, task }: { onOpen: (id: string) => void; task: KanbanTask
 }
 
 function Column({
+  onAdd,
   onDropTask,
   onOpen,
   tasks,
   name
 }: {
   name: string
+  onAdd: (status: string) => void
   onDropTask: (id: string, status: string) => void
   onOpen: (id: string) => void
   tasks: KanbanTask[]
@@ -131,13 +136,21 @@ function Column({
   const meta = columnMeta(name)
 
   return (
-    <div className="flex h-full w-72 shrink-0 flex-col">
+    <div className="group/col flex h-full w-72 shrink-0 flex-col">
       <div className="mb-1.5 flex items-center gap-1.5 px-1">
         <Codicon name={meta.codicon} size="0.8rem" style={{ color: meta.tone }} />
         <span className="text-[0.75rem] font-semibold uppercase tracking-wide text-(--ui-text-secondary)">
           {meta.label}
         </span>
         <span className="ml-auto text-[0.6875rem] tabular-nums text-(--ui-text-quaternary)">{tasks.length}</span>
+        <button
+          aria-label={`New task in ${meta.label}`}
+          className="grid size-4 place-items-center rounded text-(--ui-text-tertiary) opacity-0 transition-opacity hover:bg-(--chrome-action-hover) hover:text-foreground focus-visible:opacity-100 group-hover/col:opacity-100"
+          onClick={() => onAdd(name)}
+          type="button"
+        >
+          <Codicon name="add" size="0.75rem" />
+        </button>
       </div>
       <div
         className={cn(
@@ -281,10 +294,92 @@ function SectionLabel({ children }: { children: string }) {
   )
 }
 
+function NewTaskDialog({ onClose, target }: { onClose: () => void; target: null | string }) {
+  const [title, setTitle] = useState('')
+  const [body, setBody] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<null | string>(null)
+
+  useEffect(() => {
+    if (target) {
+      setTitle('')
+      setBody('')
+      setError(null)
+      setBusy(false)
+    }
+  }, [target])
+
+  const submit = async () => {
+    const trimmed = title.trim()
+
+    if (!trimmed || !target || busy) {
+      return
+    }
+
+    setBusy(true)
+    setError(null)
+
+    try {
+      // create() derives status (triage flag → 'triage', else 'ready'); move to
+      // the requested column when they differ, so a per-column "+" lands right.
+      const { task } = await createTask({ title: trimmed, body: body.trim() || undefined, triage: target === 'triage' })
+
+      if (task && task.status !== target) {
+        await patchTask(task.id, { status: target })
+      }
+
+      await refreshBoard()
+      onClose()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Dialog onOpenChange={open => !open && onClose()} open={Boolean(target)}>
+      <DialogContent className="max-w-md">
+        <DialogHeader>
+          <DialogTitle>New task{target ? ` — ${columnMeta(target).label}` : ''}</DialogTitle>
+        </DialogHeader>
+        <div className="flex flex-col gap-3">
+          <Input
+            autoFocus
+            onChange={event => setTitle(event.target.value)}
+            onKeyDown={event => {
+              if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+                void submit()
+              }
+            }}
+            placeholder="Title"
+            value={title}
+          />
+          <Textarea
+            className="min-h-24"
+            onChange={event => setBody(event.target.value)}
+            placeholder="Description (optional)"
+            value={body}
+          />
+          {error && <span className="text-[0.75rem] text-(--ui-danger,#f87171)">{error}</span>}
+        </div>
+        <DialogFooter>
+          <Button onClick={onClose} variant="ghost">
+            Cancel
+          </Button>
+          <Button disabled={!title.trim() || busy} onClick={() => void submit()}>
+            {busy ? 'Creating…' : 'Create'}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 export function KanbanBoardPage() {
   const board = useValue($board)
   const error = useValue($boardError)
   const [openId, setOpenId] = useState<null | string>(null)
+  const [addStatus, setAddStatus] = useState<null | string>(null)
 
   useEffect(() => {
     void refreshBoard()
@@ -315,12 +410,11 @@ export function KanbanBoardPage() {
         <Codicon name="project" size="1rem" />
         <h1 className="text-sm font-semibold text-foreground">Kanban</h1>
         <span className="text-[0.6875rem] tabular-nums text-(--ui-text-quaternary)">{total} tasks</span>
-        <Button
-          className="ml-auto"
-          onClick={() => void refreshBoard()}
-          size="sm"
-          variant="ghost"
-        >
+        <Button className="ml-auto" onClick={() => setAddStatus('triage')} size="sm" variant="ghost">
+          <Codicon name="add" size="0.8rem" />
+          New task
+        </Button>
+        <Button onClick={() => void refreshBoard()} size="sm" variant="ghost">
           <Codicon name="refresh" size="0.8rem" />
           Refresh
         </Button>
@@ -336,16 +430,30 @@ export function KanbanBoardPage() {
         </div>
       ) : total === 0 ? (
         <div className="grid flex-1 place-items-center">
-          <EmptyState title="No tasks on this board" />
+          <div className="flex flex-col items-center gap-3">
+            <EmptyState title="No tasks on this board" />
+            <Button onClick={() => setAddStatus('triage')} size="sm">
+              <Codicon name="add" size="0.8rem" />
+              New task
+            </Button>
+          </div>
         </div>
       ) : (
         <div className="flex flex-1 gap-3 overflow-x-auto p-3">
           {board.columns.map(col => (
-            <Column key={col.name} name={col.name} onDropTask={onDropTask} onOpen={setOpenId} tasks={col.tasks} />
+            <Column
+              key={col.name}
+              name={col.name}
+              onAdd={setAddStatus}
+              onDropTask={onDropTask}
+              onOpen={setOpenId}
+              tasks={col.tasks}
+            />
           ))}
         </div>
       )}
 
+      <NewTaskDialog onClose={() => setAddStatus(null)} target={addStatus} />
       <TaskDialog id={openId} onClose={() => setOpenId(null)} />
     </div>
   )
