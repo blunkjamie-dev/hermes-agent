@@ -16,7 +16,6 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
-  EmptyState,
   ErrorState,
   GlyphSpinner,
   Input,
@@ -429,11 +428,12 @@ export function KanbanBoardPage() {
           <GlyphSpinner />
         </div>
       ) : total === 0 ? (
-        <div className="grid flex-1 place-items-center">
-          <div className="flex flex-col items-center gap-3">
-            <EmptyState title="No tasks on this board" />
-            <Button onClick={() => setAddStatus('triage')} size="sm">
-              <Codicon name="add" size="0.8rem" />
+        <div className="grid flex-1 place-items-center px-4 text-center">
+          <div className="flex flex-col items-center gap-2">
+            <Codicon className="text-(--ui-text-quaternary)" name="project" size="1.25rem" />
+            <p className="text-xs text-(--ui-text-tertiary)">No tasks on this board</p>
+            <Button className="mt-0.5" onClick={() => setAddStatus('triage')} size="sm" variant="outline">
+              <Codicon name="add" size="0.75rem" />
               New task
             </Button>
           </div>
