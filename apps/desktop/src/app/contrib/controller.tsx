@@ -102,7 +102,7 @@ registry.registerMany([
     // staying collapsed behind the ⌃` toggle. height sizes the fixed track (a
     // single-pane zone declaring a height is a fixed track — the preset weight
     // is moot): a short deck, not a third of the window.
-    data: { placement: 'bottom', height: '15vh', minHeight: '7.5rem', maxHeight: '80vh', revealOnPreset: true },
+    data: { placement: 'bottom', height: '20vh', minHeight: '7.5rem', maxHeight: '80vh', revealOnPreset: true },
     render: () => <WiredPane part="terminal" />
   },
   {
@@ -158,7 +158,7 @@ registry.registerMany([
     title: 'logs',
     // revealOnPreset: the Quad layout places logs, so applying it turns the
     // logs pane on (like a ⌘K "Toggle logs") instead of leaving it collapsed.
-    data: { placement: 'bottom', height: '15vh', minHeight: '7.5rem', maxHeight: '80vh', revealOnPreset: true },
+    data: { placement: 'bottom', height: '20vh', minHeight: '7.5rem', maxHeight: '80vh', revealOnPreset: true },
     render: () => <LogsPane />
   }
 ])
