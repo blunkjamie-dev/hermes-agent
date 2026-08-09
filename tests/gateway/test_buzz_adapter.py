@@ -381,6 +381,146 @@ class TestDmClassification:
         assert a._may_reclassify_as_dm(CHANNEL) is False
 
 
+@pytest.mark.asyncio
+async def test_live_membership_subscription_looks_back_for_creation_message(monkeypatch):
+    """A creation message may land just before its membership event.
+
+    The observed pilot message was two seconds older than the subscription.
+    Keep a bounded replay window so it is included without replaying an
+    unbounded conversation history.
+    """
+    adapter = _make_adapter()
+    adapter._channel_state[CHANNEL] = {
+        "chat_type": "group",
+        "last_ts": 100,
+        "seen": {},
+    }
+
+    async def discover_dms(*, seed):
+        assert seed is False
+        adapter._channel_state[DM_CHANNEL] = {
+            "chat_type": "dm",
+            "last_ts": 0,
+            "seen": {},
+        }
+
+    monkeypatch.setattr(adapter, "_discover_dms", discover_dms)
+
+    class RecordingWebSocket:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, payload):
+            self.sent.append(json.loads(payload))
+
+    websocket = RecordingWebSocket()
+    subscriptions = {"hermes-buzz-0": CHANNEL}
+    membership_at = 1_786_229_634
+
+    await adapter._handle_membership_event(
+        websocket,
+        subscriptions,
+        {
+            "created_at": membership_at,
+            "tags": [["d", DM_CHANNEL], ["p", SELF_PUBKEY]],
+        },
+    )
+
+    request = websocket.sent[-1]
+    assert request[0] == "REQ"
+    assert request[2]["#h"] == [DM_CHANNEL]
+    assert request[2]["since"] == membership_at - 30
+
+
+@pytest.mark.asyncio
+async def test_membership_event_anchors_only_its_own_new_dm(monkeypatch):
+    """Newest-first membership replay must not share one timestamp across DMs."""
+    adapter = _make_adapter()
+    older_dm = "11111111-1111-4111-8111-111111111111"
+    newer_dm = "22222222-2222-4222-8222-222222222222"
+
+    async def discover_dms(*, seed):
+        assert seed is False
+        for channel_id in (older_dm, newer_dm):
+            adapter._channel_state.setdefault(
+                channel_id,
+                {"chat_type": "dm", "last_ts": 0, "seen": {}},
+            )
+
+    monkeypatch.setattr(adapter, "_discover_dms", discover_dms)
+
+    class RecordingWebSocket:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, payload):
+            self.sent.append(json.loads(payload))
+
+    websocket = RecordingWebSocket()
+    subscriptions = {"hermes-buzz-membership": None}
+
+    # The relay replays the newest membership first. Discovery sees both DMs,
+    # but only the newer DM may inherit this event's timestamp.
+    await adapter._handle_membership_event(
+        websocket,
+        subscriptions,
+        {"created_at": 200, "tags": [["d", newer_dm], ["p", SELF_PUBKEY]]},
+    )
+    assert list(subscriptions.values()).count(newer_dm) == 1
+    assert older_dm not in subscriptions.values()
+    assert websocket.sent[-1][2]["#h"] == [newer_dm]
+    assert websocket.sent[-1][2]["since"] == 170
+
+    # The older membership then repairs its own subscription with its own
+    # timestamp, even though broad discovery already added it to channel state.
+    await adapter._handle_membership_event(
+        websocket,
+        subscriptions,
+        {"created_at": 102, "tags": [["d", older_dm], ["p", SELF_PUBKEY]]},
+    )
+    assert list(subscriptions.values()).count(older_dm) == 1
+    assert websocket.sent[-1][2]["#h"] == [older_dm]
+    assert websocket.sent[-1][2]["since"] == 72
+
+
+@pytest.mark.asyncio
+async def test_observed_creation_message_dispatches_once_across_reconnect(monkeypatch):
+    """The captured kind-9 event normalizes once and is then de-duplicated."""
+    adapter = _make_adapter()
+    adapter._self_pubkey = SELF_PUBKEY
+    state = {
+        "chat_type": "dm",
+        "last_ts": 1_786_229_604,
+        "seen": {},
+    }
+    adapter._channel_state[DM_CHANNEL] = state
+    adapter._message_handler = AsyncMock()
+    adapter.handle_message = AsyncMock()
+    adapter.send_reaction = AsyncMock()
+    adapter._resolve_user_name = AsyncMock(return_value="Jamie Desktop")
+    event = {
+        "id": "7697e6a3" + "0" * 56,
+        "kind": 9,
+        "created_at": 1_786_229_632,
+        "pubkey": OTHER_PUBKEY,
+        "content": "hi",
+        "tags": [["h", DM_CHANNEL], ["p", SELF_PUBKEY]],
+    }
+
+    await adapter._handle_event(DM_CHANNEL, state, event)
+    # Reconnect overlap replays the same event id; it must not dispatch again.
+    await adapter._handle_event(DM_CHANNEL, state, event)
+
+    adapter.handle_message.assert_awaited_once()
+    normalized = adapter.handle_message.await_args.args[0]
+    assert normalized.text == "hi"
+    assert normalized.message_id == event["id"]
+    assert normalized.source.chat_id == DM_CHANNEL
+    assert normalized.source.chat_type == "dm"
+    assert state["last_ts"] == 1_786_229_632
+    assert list(state["seen"]) == [event["id"]]
+
+
 # ── Sending ───────────────────────────────────────────────────────────────
 
 

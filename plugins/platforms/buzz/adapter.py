@@ -106,6 +106,10 @@ _WS_AUTH_TIMEOUT = 20.0
 _WS_MAX_MESSAGE_BYTES = 2_000_000
 _WS_MEMBERSHIP_KIND = 44100
 _WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership"
+# A DM's creation message can precede its membership event by a few seconds.
+# Preserve a bounded replay anchor so the first live subscription—and an
+# immediate reconnect before that message arrives—both include it.
+_LIVE_DM_DISCOVERY_LOOKBACK_SECONDS = 30
 
 # Where to look for a credentials JSON (keys: nsec / private_key_hex) when
 # BUZZ_PRIVATE_KEY is not set.  Module-level so tests can point it at a tmpdir.
@@ -804,8 +808,17 @@ class BuzzAdapter(BasePlatformAdapter):
         """Subscribe to every watched conversation plus membership events
         (kind 44100 p-tagged to us) for live DM discovery."""
         subscriptions: Dict[str, Optional[str]] = {}
-        for index, channel_id in enumerate(list(self._channel_state)):
-            subscription_id = f"hermes-buzz-{index}"
+        for channel_id in list(self._channel_state):
+            state = self._channel_state[channel_id]
+            if (
+                state.get("membership_bound") is False
+                and not state.get("last_ts")
+            ):
+                # Broad live discovery can reveal a DM before its own
+                # membership event is replayed.  Subscribing it at last_ts=0
+                # would use now-minus-one and could skip its creation message.
+                continue
+            subscription_id = f"hermes-buzz-{len(subscriptions)}"
             subscriptions[subscription_id] = channel_id
             await self._send_channel_subscription(websocket, subscription_id, channel_id)
         if self._self_pubkey:
@@ -822,19 +835,84 @@ class BuzzAdapter(BasePlatformAdapter):
             subscriptions[_WS_MEMBERSHIP_SUB_ID] = None
         return subscriptions
 
-    async def _handle_membership_event(self, websocket, subscriptions: Dict[str, Optional[str]], event: dict) -> None:
-        """A membership event p-tagged to us: rediscover conversations and
-        subscribe to any new ones (fresh DMs dispatch from their beginning)."""
-        self._membership_since = max(self._membership_since, int(event.get("created_at") or 0))
-        before = set(self._channel_state)
+    async def _handle_membership_event(
+        self,
+        websocket,
+        subscriptions: Dict[str, Optional[str]],
+        event: dict,
+    ) -> int:
+        """Rediscover conversations and subscribe only the event's own DM.
+
+        ``dms list`` can reveal several conversations while replaying one
+        membership event.  The event's ``d`` tag is the only authoritative
+        binding between its timestamp and a channel, so never share that
+        timestamp with every newly discovered DM.
+        """
+        membership_at = int(event.get("created_at") or time.time())
+        tags = event.get("tags")
+        channel_id = ""
+        if isinstance(tags, list):
+            for tag in tags:
+                if (
+                    isinstance(tag, (list, tuple))
+                    and len(tag) > 1
+                    and tag[0] == "d"
+                ):
+                    channel_id = str(tag[1]).strip()
+                    break
+
         await self._discover_dms(seed=False)
-        for channel_id in self._channel_state:
-            if channel_id in before:
-                continue
-            subscription_id = f"hermes-buzz-dm-{len(subscriptions)}"
-            subscriptions[subscription_id] = channel_id
-            await self._send_channel_subscription(websocket, subscription_id, channel_id)
-            logger.info("Buzz: subscribed to new conversation %s", channel_id)
+        if not channel_id:
+            logger.debug("Buzz: membership event has no d-tag; no live subscription added")
+            return membership_at
+        state = self._channel_state.get(channel_id)
+        if state is None:
+            logger.debug(
+                "Buzz: membership event channel %s was not discoverable",
+                channel_id,
+            )
+            return membership_at
+        existing_subscription_id = next(
+            (
+                subscription_id
+                for subscription_id, subscribed_channel in subscriptions.items()
+                if subscribed_channel == channel_id
+            ),
+            None,
+        )
+        was_provisional = state.get("membership_bound") is False
+        if not was_provisional and existing_subscription_id is not None:
+            return membership_at
+
+        if not state.get("last_ts"):
+            # _send_channel_subscription subtracts one second for its
+            # inclusive overlap, hence the +1 here yields exactly the
+            # bounded membership lookback on the wire.
+            state["last_ts"] = max(
+                membership_at - _LIVE_DM_DISCOVERY_LOOKBACK_SECONDS + 1,
+                0,
+            )
+        if was_provisional:
+            state["membership_bound"] = True
+        if existing_subscription_id is not None:
+            # Replace a provisional now-minus-one subscription created by an
+            # older runtime/tree with the event-specific replay anchor.
+            await self._send_channel_subscription(
+                websocket,
+                existing_subscription_id,
+                channel_id,
+            )
+            logger.info("Buzz: re-anchored conversation %s", channel_id)
+            return membership_at
+        subscription_id = f"hermes-buzz-dm-{len(subscriptions)}"
+        await self._send_channel_subscription(
+            websocket,
+            subscription_id,
+            channel_id,
+        )
+        subscriptions[subscription_id] = channel_id
+        logger.info("Buzz: subscribed to new conversation %s", channel_id)
+        return membership_at
 
     async def _websocket_loop(self) -> None:
         """Persistent authenticated subscription with bounded reconnect
@@ -858,6 +936,12 @@ class BuzzAdapter(BasePlatformAdapter):
                     ) as websocket:
                         await self._authenticate_websocket(websocket)
                         subscriptions = await self._subscribe_websocket(websocket)
+                        # Historical membership events may arrive newest-first.
+                        # Commit the reconnect cursor only after EOSE; if the
+                        # socket drops mid-replay, the previous cursor is reused
+                        # and no older membership event is skipped.
+                        membership_max_seen = self._membership_since
+                        membership_replay_complete = False
                         self._ws_active = True
                         if self._ws_ready is not None:
                             self._ws_ready.set()
@@ -876,13 +960,33 @@ class BuzzAdapter(BasePlatformAdapter):
                                 if not isinstance(event, dict):
                                     continue
                                 if subscription_id == _WS_MEMBERSHIP_SUB_ID:
-                                    await self._handle_membership_event(websocket, subscriptions, event)
+                                    membership_at = await self._handle_membership_event(
+                                        websocket,
+                                        subscriptions,
+                                        event,
+                                    )
+                                    membership_max_seen = max(
+                                        membership_max_seen,
+                                        membership_at,
+                                    )
+                                    if membership_replay_complete:
+                                        self._membership_since = max(
+                                            self._membership_since,
+                                            membership_at,
+                                        )
                                     continue
                                 channel_id = subscriptions.get(subscription_id)
                                 state = self._channel_state.get(channel_id or "")
                                 if channel_id and state is not None:
                                     await self._handle_event(channel_id, state, event)
                                     self._trim_seen(state)
+                            elif message[0] == "EOSE" and len(message) >= 2:
+                                if str(message[1]) == _WS_MEMBERSHIP_SUB_ID:
+                                    self._membership_since = max(
+                                        self._membership_since,
+                                        membership_max_seen,
+                                    )
+                                    membership_replay_complete = True
                             elif message[0] == "CLOSED":
                                 detail = message[-1] if len(message) > 2 else "subscription closed"
                                 raise ConnectionError(str(detail))
@@ -967,7 +1071,12 @@ class BuzzAdapter(BasePlatformAdapter):
                 if seed:
                     await self._seed_channel(dm_id, chat_type="dm")
                 else:
-                    self._channel_state[dm_id] = {"chat_type": "dm", "last_ts": 0, "seen": OrderedDict()}
+                    self._channel_state[dm_id] = {
+                        "chat_type": "dm",
+                        "last_ts": 0,
+                        "seen": OrderedDict(),
+                        "membership_bound": False,
+                    }
                 self._channel_names.setdefault(dm_id, "DM")
 
         code, out, _err = await self._run_cli(["channels", "list"])
@@ -984,7 +1093,12 @@ class BuzzAdapter(BasePlatformAdapter):
             if seed:
                 await self._seed_channel(ch_id, chat_type="group")
             else:
-                self._channel_state[ch_id] = {"chat_type": "group", "last_ts": 0, "seen": OrderedDict()}
+                self._channel_state[ch_id] = {
+                    "chat_type": "group",
+                    "last_ts": 0,
+                    "seen": OrderedDict(),
+                    "membership_bound": False,
+                }
 
     async def _poll_channel(self, channel_id: str) -> None:
         state = self._channel_state.get(channel_id)
