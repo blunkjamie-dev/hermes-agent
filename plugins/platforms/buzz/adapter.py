@@ -901,17 +901,35 @@ class BuzzAdapter(BasePlatformAdapter):
             )
         if was_provisional:
             state["membership_bound"] = True
+
+        def next_dynamic_subscription_id() -> str:
+            index = len(subscriptions)
+            while True:
+                candidate = f"hermes-buzz-dm-{index}"
+                if candidate not in subscriptions:
+                    return candidate
+                index += 1
+
         if existing_subscription_id is not None:
-            # Replace a provisional now-minus-one subscription created by an
-            # older runtime/tree with the event-specific replay anchor.
+            # A replacement replay needs a fresh ID so queued EVENT/EOSE frames
+            # from the original REQ cannot advance or complete the new cursor.
+            replacement_id = next_dynamic_subscription_id()
             await self._send_channel_subscription(
                 websocket,
-                existing_subscription_id,
+                replacement_id,
                 channel_id,
+            )
+            subscriptions[replacement_id] = channel_id
+            subscriptions.pop(existing_subscription_id, None)
+            await websocket.send(
+                json.dumps(
+                    ["CLOSE", existing_subscription_id],
+                    separators=(",", ":"),
+                )
             )
             logger.info("Buzz: re-anchored conversation %s", channel_id)
             return membership_at
-        subscription_id = f"hermes-buzz-dm-{len(subscriptions)}"
+        subscription_id = next_dynamic_subscription_id()
         await self._send_channel_subscription(
             websocket,
             subscription_id,
@@ -999,6 +1017,8 @@ class BuzzAdapter(BasePlatformAdapter):
                                     # channel subscription.  Start its replay
                                     # cursor from the state actually used by
                                     # that subscription.
+                                    for retired_id in set(channel_replays) - set(subscriptions):
+                                        channel_replays.pop(retired_id, None)
                                     for dynamic_id, dynamic_channel in subscriptions.items():
                                         if dynamic_channel is None:
                                             continue

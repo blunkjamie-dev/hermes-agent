@@ -125,6 +125,7 @@ async def test_websocket_auth_raises_on_rejection():
 class _ReplayWebSocket:
     def __init__(self, frames):
         self._frames = iter(frames)
+        self.sent = []
 
     def __aiter__(self):
         return self
@@ -134,6 +135,9 @@ class _ReplayWebSocket:
             return json.dumps(next(self._frames))
         except StopIteration as exc:
             raise StopAsyncIteration from exc
+
+    async def send(self, raw):
+        self.sent.append(json.loads(raw))
 
 
 class _ReplayContext:
@@ -318,6 +322,90 @@ async def test_channel_cursor_commits_only_after_channel_eose(
         # replay floor on reconnect.
         assert state["last_ts"] - 1 <= 995
     assert adapter._dispatch_message.await_count == (2 if include_eose else 1)
+
+
+@pytest.mark.asyncio
+async def test_reanchored_subscription_uses_fresh_id_and_new_eose_gate(monkeypatch):
+    """A replacement replay must not inherit the old subscription's EOSE."""
+    adapter = _make_adapter()
+    state = {
+        "chat_type": "dm",
+        "last_ts": 100,
+        "seen": {},
+        "membership_bound": False,
+    }
+    adapter._channel_state[CHANNEL] = state
+    adapter._authenticate_websocket = AsyncMock()
+    adapter._discover_dms = AsyncMock()
+    adapter._resolve_user_name = AsyncMock(return_value="Sender")
+    adapter._dispatch_message = AsyncMock()
+
+    old_subscription_id = "hermes-buzz-0"
+    replacement_id = "hermes-buzz-dm-2"
+    membership_id = _buzz_mod._WS_MEMBERSHIP_SUB_ID
+    event = {
+        "id": "replacement-newer-event",
+        "created_at": 130,
+        "kind": 9,
+        "pubkey": "a" * 64,
+        "content": "newer",
+        "tags": [],
+    }
+    frames = [
+        ["EOSE", old_subscription_id],
+        [
+            "EVENT",
+            membership_id,
+            {"created_at": 110, "tags": [["d", CHANNEL]]},
+        ],
+        # Queued frames from the retired subscription must be ignored.
+        ["EOSE", old_subscription_id],
+        ["EVENT", old_subscription_id, event],
+        # The replacement replay arrives newest-first and disconnects before
+        # its own EOSE; the persisted cursor must retain the original floor.
+        ["EVENT", replacement_id, event],
+    ]
+    websocket = _ReplayWebSocket(frames)
+    adapter._subscribe_websocket = AsyncMock(
+        return_value={old_subscription_id: CHANNEL, membership_id: None}
+    )
+
+    calls = 0
+    observed_cursors = []
+
+    def connect(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return _ReplayContext(websocket)
+
+        class CancelOnReconnect:
+            async def __aenter__(self):
+                observed_cursors.append(state["last_ts"])
+                raise asyncio.CancelledError
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        return CancelOnReconnect()
+
+    monkeypatch.setitem(sys.modules, "websockets", SimpleNamespace(connect=connect))
+
+    with pytest.raises(asyncio.CancelledError):
+        await adapter._websocket_loop()
+
+    assert observed_cursors == [100]
+    assert state["last_ts"] == 100
+    assert state["last_ts"] - 1 <= 120
+    adapter._dispatch_message.assert_awaited_once()
+    assert ["CLOSE", old_subscription_id] in websocket.sent
+    replacement_requests = [
+        request
+        for request in websocket.sent
+        if request[0] == "REQ" and request[1] == replacement_id
+    ]
+    assert len(replacement_requests) == 1
+    assert replacement_requests[0][2]["since"] == 99
 
 
 @pytest.mark.asyncio
