@@ -148,6 +148,32 @@ class _ReplayContext:
 
 
 @pytest.mark.asyncio
+async def test_zero_cursor_subscription_persists_its_wire_floor(monkeypatch):
+    adapter = _make_adapter()
+    state = {
+        "chat_type": "dm",
+        "last_ts": 0,
+        "seen": {},
+        "membership_bound": True,
+    }
+    adapter._channel_state[CHANNEL] = state
+
+    monkeypatch.setattr(_buzz_mod.time, "time", lambda: 1000)
+    first_websocket = _FakeWebSocket()
+    await adapter._send_channel_subscription(first_websocket, "sub-1", CHANNEL)
+
+    assert state["last_ts"] == 1000
+    assert first_websocket.sent[-1][2]["since"] == 999
+
+    monkeypatch.setattr(_buzz_mod.time, "time", lambda: 2000)
+    reconnect_websocket = _FakeWebSocket()
+    await adapter._send_channel_subscription(reconnect_websocket, "sub-2", CHANNEL)
+
+    assert state["last_ts"] == 1000
+    assert reconnect_websocket.sent[-1][2]["since"] == 999
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("include_eose", "expected_cursor"),
     [(False, 50), (True, 200)],
@@ -200,6 +226,98 @@ async def test_membership_cursor_commits_only_after_eose(
 
     assert adapter._membership_since == expected_cursor
     assert adapter._handle_membership_event.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("include_eose", "expected_cursor"),
+    [(False, 971), (True, 1001)],
+)
+async def test_channel_cursor_commits_only_after_channel_eose(
+    monkeypatch,
+    include_eose,
+    expected_cursor,
+):
+    """A newest-first replay must retain its floor if the socket drops."""
+    adapter = _make_adapter()
+    state = {
+        "chat_type": "dm",
+        # _send_channel_subscription subtracts one, so the wire floor is 970.
+        "last_ts": 971,
+        "seen": {},
+        "membership_bound": True,
+    }
+    adapter._channel_state[CHANNEL] = state
+    adapter._resolve_user_name = AsyncMock(return_value="Sender")
+    adapter._dispatch_message = AsyncMock()
+
+    subscription_id = "hermes-buzz-0"
+    event = {
+        "id": "newer-event",
+        "created_at": 999,
+        "kind": 9,
+        "pubkey": "a" * 64,
+        "content": "newer",
+        "tags": [],
+    }
+    frames = [["EVENT", subscription_id, event]]
+    if include_eose:
+        frames.extend(
+            [
+                ["EOSE", subscription_id],
+                [
+                    "EVENT",
+                    _buzz_mod._WS_MEMBERSHIP_SUB_ID,
+                    {"created_at": 200, "tags": []},
+                ],
+                [
+                    "EVENT",
+                    subscription_id,
+                    {**event, "id": "live-event", "created_at": 1001},
+                ],
+            ]
+        )
+
+    adapter._authenticate_websocket = AsyncMock()
+    adapter._subscribe_websocket = AsyncMock(
+        return_value={
+            subscription_id: CHANNEL,
+            _buzz_mod._WS_MEMBERSHIP_SUB_ID: None,
+        }
+    )
+    adapter._handle_membership_event = AsyncMock(return_value=200)
+
+    calls = 0
+    observed_cursors = []
+
+    def connect(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return _ReplayContext(_ReplayWebSocket(frames))
+
+        class CancelOnReconnect:
+            async def __aenter__(self):
+                observed_cursors.append(state["last_ts"])
+                raise asyncio.CancelledError
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        return CancelOnReconnect()
+
+    monkeypatch.setitem(sys.modules, "websockets", SimpleNamespace(connect=connect))
+
+    with pytest.raises(asyncio.CancelledError):
+        await adapter._websocket_loop()
+
+    assert observed_cursors == [expected_cursor]
+    assert state["last_ts"] == expected_cursor
+    if not include_eose:
+        # The captured older creation event at 995 remains inside the original
+        # replay floor on reconnect.
+        assert state["last_ts"] - 1 <= 995
+    assert adapter._dispatch_message.await_count == (2 if include_eose else 1)
 
 
 @pytest.mark.asyncio

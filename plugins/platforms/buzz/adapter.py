@@ -796,7 +796,14 @@ class BuzzAdapter(BasePlatformAdapter):
 
     async def _send_channel_subscription(self, websocket, subscription_id: str, channel_id: str) -> None:
         state = self._channel_state.get(channel_id) or {}
-        since = max(int(state.get("last_ts") or time.time()) - 1, 0)
+        last_ts = int(state.get("last_ts") or 0)
+        if not last_ts:
+            # Persist the actual wire floor.  Otherwise a disconnect before
+            # channel EOSE would leave last_ts=0 and a reconnect would compute
+            # a later now-minus-one floor, potentially skipping the first event.
+            last_ts = int(time.time())
+            state["last_ts"] = last_ts
+        since = max(last_ts - 1, 0)
         request = [
             "REQ",
             subscription_id,
@@ -942,6 +949,20 @@ class BuzzAdapter(BasePlatformAdapter):
                         # and no older membership event is skipped.
                         membership_max_seen = self._membership_since
                         membership_replay_complete = False
+                        channel_replays = {}
+                        for subscription_id, channel_id in subscriptions.items():
+                            if channel_id is None:
+                                continue
+                            state = self._channel_state.get(channel_id)
+                            if state is None:
+                                continue
+                            floor = int(state.get("last_ts") or 0)
+                            channel_replays[subscription_id] = {
+                                "channel_id": channel_id,
+                                "floor": floor,
+                                "max_seen": floor,
+                                "complete": False,
+                            }
                         self._ws_active = True
                         if self._ws_ready is not None:
                             self._ws_ready.set()
@@ -974,19 +995,66 @@ class BuzzAdapter(BasePlatformAdapter):
                                             self._membership_since,
                                             membership_at,
                                         )
+                                    # A membership event may add or re-anchor a
+                                    # channel subscription.  Start its replay
+                                    # cursor from the state actually used by
+                                    # that subscription.
+                                    for dynamic_id, dynamic_channel in subscriptions.items():
+                                        if dynamic_channel is None:
+                                            continue
+                                        dynamic_state = self._channel_state.get(dynamic_channel)
+                                        if dynamic_state is None:
+                                            continue
+                                        floor = int(dynamic_state.get("last_ts") or 0)
+                                        replay = channel_replays.get(dynamic_id)
+                                        if replay is None or (
+                                            not replay["complete"]
+                                            and replay["floor"] != floor
+                                        ):
+                                            channel_replays[dynamic_id] = {
+                                                "channel_id": dynamic_channel,
+                                                "floor": floor,
+                                                "max_seen": floor,
+                                                "complete": False,
+                                            }
                                     continue
                                 channel_id = subscriptions.get(subscription_id)
                                 state = self._channel_state.get(channel_id or "")
                                 if channel_id and state is not None:
-                                    await self._handle_event(channel_id, state, event)
+                                    replay = channel_replays.get(subscription_id)
+                                    replay_complete = bool(
+                                        replay and replay.get("complete")
+                                    )
+                                    await self._handle_event(
+                                        channel_id,
+                                        state,
+                                        event,
+                                        commit_cursor=replay is None or replay_complete,
+                                    )
+                                    if replay is not None and not replay_complete:
+                                        replay["max_seen"] = max(
+                                            int(replay["max_seen"]),
+                                            int(event.get("created_at") or 0),
+                                        )
                                     self._trim_seen(state)
                             elif message[0] == "EOSE" and len(message) >= 2:
-                                if str(message[1]) == _WS_MEMBERSHIP_SUB_ID:
+                                eose_subscription_id = str(message[1])
+                                if eose_subscription_id == _WS_MEMBERSHIP_SUB_ID:
                                     self._membership_since = max(
                                         self._membership_since,
                                         membership_max_seen,
                                     )
                                     membership_replay_complete = True
+                                replay = channel_replays.get(eose_subscription_id)
+                                if replay is not None and not replay["complete"]:
+                                    channel_id = str(replay["channel_id"])
+                                    state = self._channel_state.get(channel_id)
+                                    if state is not None:
+                                        state["last_ts"] = max(
+                                            int(state.get("last_ts") or 0),
+                                            int(replay["max_seen"]),
+                                        )
+                                    replay["complete"] = True
                             elif message[0] == "CLOSED":
                                 detail = message[-1] if len(message) > 2 else "subscription closed"
                                 raise ConnectionError(str(detail))
@@ -1119,14 +1187,22 @@ class BuzzAdapter(BasePlatformAdapter):
             await self._handle_event(channel_id, state, event)
         self._trim_seen(state)
 
-    async def _handle_event(self, channel_id: str, state: dict, event: dict) -> None:
+    async def _handle_event(
+        self,
+        channel_id: str,
+        state: dict,
+        event: dict,
+        *,
+        commit_cursor: bool = True,
+    ) -> None:
         """De-dupe, filter, and dispatch a single ``messages get`` event."""
         event_id = str(event.get("id") or "")
         created_at = int(event.get("created_at") or 0)
         if not event_id or event_id in state["seen"]:
             return
         state["seen"][event_id] = None
-        state["last_ts"] = max(state["last_ts"], created_at)
+        if commit_cursor:
+            state["last_ts"] = max(state["last_ts"], created_at)
 
         if int(event.get("kind") or 0) != _CHAT_KIND:
             return
